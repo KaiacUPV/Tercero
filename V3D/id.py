@@ -1,22 +1,38 @@
 ﻿import cv2
 import cv2.aruco as aruco
+import json
 import numpy as np
+import os
+import queue
 import random
 import socket
 import struct
+import threading
 import time
-import wave
 from pathlib import Path
-
-try:
-    import winsound
-except ImportError:
-    winsound = None
 
 try:
     import pygame
 except ImportError:
     pygame = None
+
+try:
+    from openal import oalOpen, oalQuit
+except ImportError:
+    oalOpen = None
+    oalQuit = None
+
+try:
+    import sounddevice as sd
+except ImportError:
+    sd = None
+
+try:
+    from vosk import KaldiRecognizer, Model, SetLogLevel
+except ImportError:
+    KaldiRecognizer = None
+    Model = None
+    SetLogLevel = None
 
 # ===== Constantes =====
 PRIMARY_MARKER = 17
@@ -53,15 +69,15 @@ HANDLE_FIN_COUNT = 3
 HANDLE_FIN_RADIUS_SCALE = 0.14
 HANDLE_FIN_HEIGHT_M = 0.018
 HANDLE_FIN_POSITIONS = (0.82, 0.90)
-LASER_ON_DURATION_S = 0.24
-LASER_OFF_DURATION_S = 0.16
+LASER_ON_DURATION_S = 0.34
+LASER_OFF_DURATION_S = 0.26
 LASER_MIN_VISIBLE_POWER = 0.001
 LASER_MIN_DRAW_DEPTH_M = 0.06
 MAX_PROJECTED_COORD_ABS_PX = 20000.0
 KEY_TOGGLE_COOLDOWN_S = 0.18
 SABER_ON_SOUND_FILE = "sable-on.wav"
 SABER_LOOP_SOUND_FILE = "loop.wav"
-SABER_ON_FALLBACK_DURATION_S = 0.35
+SABER_OFF_SOUND_FILE = "sable-off.wav"
 SABER_LOOP_START_DELAY_S = 0.09
 CAMERA_HORIZONTAL_FLIP_DEFAULT = False
 DEFAULT_SABER_COLOR_KEY = "r"
@@ -135,6 +151,337 @@ POSE_MAGIC = b"SABR"
 POSE_VERSION = 1
 WINDOW_NAME = "Detectar ArUco"
 FULLSCREEN_PREVIEW = True
+VOICE_CONTROL_ENABLED = True
+VOICE_MODEL_DIR = "vosk-model-small-es-0.42"
+VOICE_SAMPLE_RATE = 16000
+VOICE_BLOCK_SIZE = 8000
+VOICE_COMMAND_COOLDOWN_S = 0.75
+VOICE_INPUT_DEVICE_HINT = "C-Media"  # Cambia a "NexiGo" si prefieres el micro de webcam.
+
+
+class VoiceCommandListener:
+    def __init__(
+        self,
+        model_path: Path,
+        sample_rate: int,
+        block_size: int,
+        device_hint: str | None = None,
+    ):
+        self.model_path = Path(model_path)
+        self.sample_rate = int(sample_rate)
+        self.block_size = int(block_size)
+        self.device_hint = (device_hint or "").strip().lower() or None
+        self.error_message = None
+        self.active_device = None
+        self.active_device_name = None
+        self.active_sample_rate = None
+
+        self._model = None
+        self._recognizer = None
+        self._running = threading.Event()
+        self._worker = None
+        self._audio_queue: queue.Queue[bytes] = queue.Queue()
+        self._command_queue: queue.Queue[tuple[str, str]] = queue.Queue()
+        self._device_candidates: list[int] = []
+        self._last_enqueued_text = ""
+
+    def start(self) -> bool:
+        if sd is None or Model is None or KaldiRecognizer is None:
+            self.error_message = (
+                "[Voice] Librerias faltantes. Instala: pip install vosk sounddevice"
+            )
+            return False
+
+        if not self.model_path.exists():
+            self.error_message = (
+                f"[Voice] Modelo no encontrado en {self.model_path}. "
+                "Descarga un modelo en https://alphacephei.com/vosk/models y extraelo ahi."
+            )
+            return False
+
+        try:
+            if SetLogLevel is not None:
+                SetLogLevel(-1)
+
+            self._model = Model(str(self.model_path))
+            self._device_candidates = self._build_device_candidates()
+            if not self._device_candidates:
+                self.error_message = "[Voice] No hay microfonos de entrada disponibles."
+                return False
+
+            self._running.set()
+            self._worker = threading.Thread(target=self._run, daemon=True)
+            self._worker.start()
+            return True
+        except Exception as exc:
+            self.error_message = f"[Voice] Error al iniciar voz: {exc}"
+            self._running.clear()
+            return False
+
+    def stop(self) -> None:
+        self._running.clear()
+        if self._worker is not None:
+            self._worker.join(timeout=1.0)
+            self._worker = None
+
+    def pop_commands(self) -> list[tuple[str, str]]:
+        commands = []
+        while True:
+            try:
+                commands.append(self._command_queue.get_nowait())
+            except queue.Empty:
+                break
+        return commands
+
+    @staticmethod
+    def _extract_text(raw_json: str, key: str) -> str:
+        try:
+            payload = json.loads(raw_json)
+        except json.JSONDecodeError:
+            return ""
+
+        text = str(payload.get(key, "")).strip().lower()
+        return " ".join(text.split())
+
+    @staticmethod
+    def _parse_command(recognized_text: str) -> str | None:
+        if not recognized_text:
+            return None
+
+        tokens = set(recognized_text.split())
+
+        red_words = {"rojo", "roja", "red", "erre"}
+        green_words = {"verde", "green", "ge"}
+        blue_words = {"azul", "blue", "be"}
+        flip_words = {
+            "invertir",
+            "invierte",
+            "invertido",
+            "invertida",
+            "espejo",
+            "espejar",
+            "flip",
+            "mirror",
+        }
+
+        if recognized_text in {"r", "g", "b"}:
+            return f"color_{recognized_text}"
+
+        if tokens & red_words:
+            return "color_r"
+        if tokens & green_words:
+            return "color_g"
+        if tokens & blue_words:
+            return "color_b"
+
+        if tokens & flip_words:
+            return "toggle_flip"
+
+        toggle_phrases = (
+            "espacio",
+            "encender sable",
+            "enciende sable",
+            "apagar sable",
+            "apaga sable",
+            "prender sable",
+            "prende sable",
+            "activar sable",
+            "desactivar sable",
+            "encender espada",
+            "enciende espada",
+            "apagar espada",
+            "apaga espada",
+            "activar espada",
+            "desactivar espada",
+        )
+        if any(phrase in recognized_text for phrase in toggle_phrases):
+            return "toggle_power"
+
+        return None
+
+    def _build_device_candidates(self) -> list[int]:
+        try:
+            devices = sd.query_devices()
+        except Exception:
+            return []
+
+        ranked = []
+        default_input = None
+        try:
+            default_pair = sd.default.device
+            if isinstance(default_pair, (tuple, list)) and len(default_pair) > 0:
+                maybe_index = int(default_pair[0])
+                if maybe_index >= 0:
+                    default_input = maybe_index
+        except Exception:
+            default_input = None
+
+        for idx, device in enumerate(devices):
+            max_inputs = int(device.get("max_input_channels", 0))
+            if max_inputs <= 0:
+                continue
+
+            name = str(device.get("name", ""))
+            name_lower = name.lower()
+            try:
+                hostapi_name = str(sd.query_hostapis(device["hostapi"])["name"])
+            except Exception:
+                hostapi_name = "unknown"
+            hostapi_lower = hostapi_name.lower()
+
+            score = 0
+            if default_input is not None and idx == default_input:
+                score += 70
+
+            if self.device_hint and self.device_hint in name_lower:
+                score += 2000
+
+            if "wasapi" in hostapi_lower:
+                score += 260
+            elif "wdm-ks" in hostapi_lower:
+                score += 220
+            elif "directsound" in hostapi_lower:
+                score += 140
+            elif "mme" in hostapi_lower:
+                score += 80
+
+            default_sr = float(device.get("default_samplerate", 0.0))
+            if abs(default_sr - float(self.sample_rate)) < 1.0:
+                score += 120
+
+            if max_inputs >= 2:
+                score += 40
+
+            if "webcam" in name_lower and self.device_hint is None:
+                score -= 180
+            if ("hands-free" in name_lower or "auriculares con micr" in name_lower) and self.device_hint is None:
+                score -= 140
+            if "microsoft sound mapper" in name_lower or "controlador primario" in name_lower:
+                score -= 900
+
+            ranked.append((score, idx, name, hostapi_name))
+
+        ranked.sort(key=lambda row: (row[0], row[1]), reverse=True)
+        return [idx for _, idx, _, _ in ranked]
+
+    @staticmethod
+    def _describe_device(device_index: int) -> str:
+        try:
+            device = sd.query_devices(device_index)
+            hostapi_name = sd.query_hostapis(device["hostapi"])["name"]
+            return f"{device_index}: {device['name']} ({hostapi_name})"
+        except Exception:
+            return str(device_index)
+
+    def _candidate_sample_rates(self, device_index: int) -> list[int]:
+        rates = []
+
+        preferred = int(max(8000, self.sample_rate))
+        rates.append(preferred)
+
+        try:
+            device = sd.query_devices(device_index)
+            default_rate = int(round(float(device.get("default_samplerate", 0.0))))
+            if default_rate >= 8000 and default_rate not in rates:
+                rates.append(default_rate)
+        except Exception:
+            pass
+
+        return rates
+
+    def _enqueue_command_if_any(self, recognized_text: str) -> None:
+        normalized_text = " ".join(recognized_text.strip().lower().split())
+        if not normalized_text:
+            return
+
+        command = self._parse_command(normalized_text)
+        if command is None:
+            return
+
+        if normalized_text == self._last_enqueued_text:
+            return
+
+        self._last_enqueued_text = normalized_text
+        self._command_queue.put((command, normalized_text))
+
+    def _run_recognition_loop(self) -> None:
+        while self._running.is_set():
+            try:
+                chunk = self._audio_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            if self._recognizer is None:
+                continue
+
+            if self._recognizer.AcceptWaveform(chunk):
+                final_text = self._extract_text(self._recognizer.Result(), "text")
+                self._enqueue_command_if_any(final_text)
+            else:
+                partial_text = self._extract_text(self._recognizer.PartialResult(), "partial")
+                self._enqueue_command_if_any(partial_text)
+
+    def _audio_callback(self, indata, frames, time_info, status) -> None:
+        if not self._running.is_set():
+            return
+        if status:
+            return
+        self._audio_queue.put(bytes(indata))
+
+    def _run(self) -> None:
+        last_error = None
+        try:
+            for device_index in self._device_candidates:
+                if not self._running.is_set():
+                    break
+
+                self.active_device = device_index
+                self.active_device_name = self._describe_device(device_index)
+                for stream_rate in self._candidate_sample_rates(device_index):
+                    if not self._running.is_set():
+                        break
+
+                    while True:
+                        try:
+                            self._audio_queue.get_nowait()
+                        except queue.Empty:
+                            break
+
+                    self.active_sample_rate = stream_rate
+                    try:
+                        if self._model is None:
+                            raise RuntimeError("Modelo Vosk no inicializado")
+                        self._recognizer = KaldiRecognizer(self._model, float(stream_rate))
+                        print(
+                            f"[Voice] Microfono seleccionado: {self.active_device_name} "
+                            f"@ {stream_rate} Hz"
+                        )
+                        with sd.RawInputStream(
+                            samplerate=stream_rate,
+                            blocksize=self.block_size,
+                            dtype="int16",
+                            channels=1,
+                            device=device_index,
+                            callback=self._audio_callback,
+                        ):
+                            self._run_recognition_loop()
+                        return
+                    except Exception as exc:
+                        last_error = exc
+                        print(
+                            f"[Voice] No se pudo abrir {self.active_device_name} "
+                            f"a {stream_rate} Hz: {exc}"
+                        )
+
+            if self._running.is_set():
+                if last_error is None:
+                    self.error_message = "[Voice] No se pudo iniciar el microfono de voz."
+                else:
+                    self.error_message = f"[Voice] Error en microfono/reconocimiento: {last_error}"
+        except Exception as exc:
+            self.error_message = f"[Voice] Error en el hilo de voz: {exc}"
+        finally:
+            self._running.clear()
 
 
 class PoseUdpSender:
@@ -494,37 +841,53 @@ def projected_points_are_safe(points_2d: np.ndarray, max_abs_px: float) -> bool:
     return float(np.max(np.abs(pts))) <= max_abs_px
 
 
-def get_wav_duration_seconds(sound_path: Path, fallback_seconds: float) -> float:
-    if not sound_path.exists():
-        return fallback_seconds
-
-    try:
-        with wave.open(str(sound_path), "rb") as wav_file:
-            frame_rate = wav_file.getframerate()
-            frame_count = wav_file.getnframes()
-            if frame_rate <= 0:
-                return fallback_seconds
-            return float(frame_count) / float(frame_rate)
-    except (wave.Error, OSError):
-        return fallback_seconds
-
-
 AUDIO_BACKEND = "none"
+OPENAL_ON_SOURCE = None
+OPENAL_LOOP_SOURCE = None
+OPENAL_OFF_SOURCE = None
 PYGAME_ON_SOUND = None
 PYGAME_LOOP_SOUND = None
+PYGAME_OFF_SOUND = None
 PYGAME_ON_CHANNEL = None
 PYGAME_LOOP_CHANNEL = None
 
 
-def init_audio_backend(saber_on_path: Path, saber_loop_path: Path) -> str:
+def init_audio_backend(saber_on_path: Path, saber_loop_path: Path, saber_off_path: Path) -> str:
     global AUDIO_BACKEND
-    global PYGAME_ON_SOUND, PYGAME_LOOP_SOUND, PYGAME_ON_CHANNEL, PYGAME_LOOP_CHANNEL
+    global OPENAL_ON_SOURCE, OPENAL_LOOP_SOURCE, OPENAL_OFF_SOURCE
+    global PYGAME_ON_SOUND, PYGAME_LOOP_SOUND, PYGAME_OFF_SOUND, PYGAME_ON_CHANNEL, PYGAME_LOOP_CHANNEL
 
     AUDIO_BACKEND = "none"
+    OPENAL_ON_SOURCE = None
+    OPENAL_LOOP_SOURCE = None
+    OPENAL_OFF_SOURCE = None
     PYGAME_ON_SOUND = None
     PYGAME_LOOP_SOUND = None
+    PYGAME_OFF_SOUND = None
     PYGAME_ON_CHANNEL = None
     PYGAME_LOOP_CHANNEL = None
+
+    if oalOpen is not None:
+        try:
+            if saber_on_path.exists():
+                OPENAL_ON_SOURCE = oalOpen(str(saber_on_path))
+            if saber_loop_path.exists():
+                OPENAL_LOOP_SOURCE = oalOpen(str(saber_loop_path))
+                OPENAL_LOOP_SOURCE.set_looping(True)
+            if saber_off_path.exists():
+                OPENAL_OFF_SOURCE = oalOpen(str(saber_off_path))
+
+            AUDIO_BACKEND = "openal"
+            return AUDIO_BACKEND
+        except Exception:
+            OPENAL_ON_SOURCE = None
+            OPENAL_LOOP_SOURCE = None
+            OPENAL_OFF_SOURCE = None
+            if oalQuit is not None:
+                try:
+                    oalQuit()
+                except Exception:
+                    pass
 
     if pygame is not None:
         try:
@@ -535,6 +898,8 @@ def init_audio_backend(saber_on_path: Path, saber_loop_path: Path) -> str:
                 PYGAME_ON_SOUND = pygame.mixer.Sound(str(saber_on_path))
             if saber_loop_path.exists():
                 PYGAME_LOOP_SOUND = pygame.mixer.Sound(str(saber_loop_path))
+            if saber_off_path.exists():
+                PYGAME_OFF_SOUND = pygame.mixer.Sound(str(saber_off_path))
 
             PYGAME_ON_CHANNEL = pygame.mixer.Channel(0)
             PYGAME_LOOP_CHANNEL = pygame.mixer.Channel(1)
@@ -543,47 +908,44 @@ def init_audio_backend(saber_on_path: Path, saber_loop_path: Path) -> str:
         except Exception:
             PYGAME_ON_SOUND = None
             PYGAME_LOOP_SOUND = None
+            PYGAME_OFF_SOUND = None
             PYGAME_ON_CHANNEL = None
             PYGAME_LOOP_CHANNEL = None
-
-    if winsound is not None:
-        AUDIO_BACKEND = "winsound"
 
     return AUDIO_BACKEND
 
 
-def play_wav_once_async(sound_path: Path) -> bool:
-    if winsound is None:
+def play_openal_source(source) -> bool:
+    if source is None:
         return False
 
-    if not sound_path.exists():
-        return False
-
-    flags = winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT
     try:
-        winsound.PlaySound(str(sound_path), flags)
-        return True
-    except RuntimeError:
-        # Si el dispositivo de audio no esta disponible, no se interrumpe el juego.
-        return False
+        source.stop()
+    except Exception:
+        pass
 
-
-def play_wav_loop_async(sound_path: Path) -> bool:
-    if winsound is None:
-        return False
-
-    if not sound_path.exists():
-        return False
-
-    flags = winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_LOOP | winsound.SND_NODEFAULT
     try:
-        winsound.PlaySound(str(sound_path), flags)
+        source.rewind()
+    except Exception:
+        pass
+
+    try:
+        source.play()
         return True
-    except RuntimeError:
+    except Exception:
         return False
 
 
 def stop_all_sounds() -> None:
+    if AUDIO_BACKEND == "openal":
+        for source in (OPENAL_ON_SOURCE, OPENAL_LOOP_SOURCE, OPENAL_OFF_SOURCE):
+            if source is None:
+                continue
+            try:
+                source.stop()
+            except Exception:
+                pass
+
     if AUDIO_BACKEND == "pygame" and pygame is not None:
         try:
             if PYGAME_ON_CHANNEL is not None:
@@ -593,14 +955,11 @@ def stop_all_sounds() -> None:
         except pygame.error:
             pass
 
-    if AUDIO_BACKEND == "winsound" and winsound is not None:
-        try:
-            winsound.PlaySound(None, 0)
-        except RuntimeError:
-            pass
-
 
 def play_saber_on_sound(sound_path: Path) -> bool:
+    if AUDIO_BACKEND == "openal":
+        return play_openal_source(OPENAL_ON_SOURCE)
+
     if AUDIO_BACKEND == "pygame" and pygame is not None:
         if PYGAME_ON_SOUND is None or PYGAME_ON_CHANNEL is None:
             return False
@@ -610,10 +969,29 @@ def play_saber_on_sound(sound_path: Path) -> bool:
         except pygame.error:
             return False
 
-    return play_wav_once_async(sound_path)
+    return False
+
+
+def play_saber_off_sound(sound_path: Path) -> bool:
+    if AUDIO_BACKEND == "openal":
+        return play_openal_source(OPENAL_OFF_SOURCE)
+
+    if AUDIO_BACKEND == "pygame" and pygame is not None:
+        if PYGAME_OFF_SOUND is None or PYGAME_ON_CHANNEL is None:
+            return False
+        try:
+            PYGAME_ON_CHANNEL.play(PYGAME_OFF_SOUND, loops=0)
+            return True
+        except pygame.error:
+            return False
+
+    return False
 
 
 def play_saber_loop_sound(sound_path: Path) -> bool:
+    if AUDIO_BACKEND == "openal":
+        return play_openal_source(OPENAL_LOOP_SOURCE)
+
     if AUDIO_BACKEND == "pygame" and pygame is not None:
         if PYGAME_LOOP_SOUND is None or PYGAME_LOOP_CHANNEL is None:
             return False
@@ -623,11 +1001,17 @@ def play_saber_loop_sound(sound_path: Path) -> bool:
         except pygame.error:
             return False
 
-    return play_wav_loop_async(sound_path)
+    return False
 
 
 def shutdown_audio_backend() -> None:
     stop_all_sounds()
+    if AUDIO_BACKEND == "openal" and oalQuit is not None:
+        try:
+            oalQuit()
+        except Exception:
+            pass
+
     if AUDIO_BACKEND == "pygame" and pygame is not None:
         try:
             if pygame.mixer.get_init():
@@ -637,6 +1021,10 @@ def shutdown_audio_backend() -> None:
 
 
 cap = cv2.VideoCapture(0)
+if not cap.isOpened():
+    print("[Camera] No se pudo abrir la camara 0. Cierra otras apps que usen la webcam y reintenta.")
+    raise SystemExit(1)
+
 # Buscamos el archivo subiendo un nivel y entrando en Proyecto_VR3 o en la misma carpeta
 calibration_path = Path(__file__).parent.parent / "Proyecto_VR3" / "camera_calibration.npz"
 if not calibration_path.exists():
@@ -653,16 +1041,46 @@ last_frame_time = time.perf_counter()
 last_toggle_time = 0.0
 saber_on_sound_path = Path(__file__).with_name(SABER_ON_SOUND_FILE)
 saber_loop_sound_path = Path(__file__).with_name(SABER_LOOP_SOUND_FILE)
-saber_on_duration_s = get_wav_duration_seconds(saber_on_sound_path, SABER_ON_FALLBACK_DURATION_S)
-audio_backend = init_audio_backend(saber_on_sound_path, saber_loop_sound_path)
-if audio_backend == "pygame":
-    loop_start_delay_s = SABER_LOOP_START_DELAY_S
-else:
-    # winsound no mezcla dos WAV: retrasar loop para no cortar el sonido de encendido.
-    loop_start_delay_s = max(SABER_LOOP_START_DELAY_S, saber_on_duration_s)
+saber_off_sound_path = Path(__file__).with_name(SABER_OFF_SOUND_FILE)
+audio_backend = init_audio_backend(saber_on_sound_path, saber_loop_sound_path, saber_off_sound_path)
+loop_start_delay_s = SABER_LOOP_START_DELAY_S
 print(f"[Audio] Backend activo: {audio_backend}")
-if audio_backend != "pygame":
-    print("[Audio] Para solapar 'sable-on' y 'loop', instala pygame (pip install pygame).")
+if audio_backend == "none":
+    print("[Audio] Sin backend. Instala PyOpenAL (pip install PyOpenAL) o pygame.")
+print(f"[App] PID: {os.getpid()} | ESC: salir | Espacio/RGB/I: teclado | Voz activa si modelo disponible")
+
+voice_listener = None
+voice_last_command_time = {
+    "toggle_power": 0.0,
+    "toggle_flip": 0.0,
+    "color_r": 0.0,
+    "color_g": 0.0,
+    "color_b": 0.0,
+}
+
+if VOICE_CONTROL_ENABLED:
+    voice_model_path = Path(__file__).with_name(VOICE_MODEL_DIR)
+    voice_listener = VoiceCommandListener(
+        model_path=voice_model_path,
+        sample_rate=VOICE_SAMPLE_RATE,
+        block_size=VOICE_BLOCK_SIZE,
+        device_hint=VOICE_INPUT_DEVICE_HINT,
+    )
+    if voice_listener.start():
+        time.sleep(0.15)
+        if voice_listener.active_device_name:
+            if voice_listener.active_sample_rate is not None:
+                print(
+                    f"[Voice] Entrada activa: {voice_listener.active_device_name} "
+                    f"@ {voice_listener.active_sample_rate} Hz"
+                )
+            else:
+                print(f"[Voice] Entrada activa: {voice_listener.active_device_name}")
+        print("[Voice] Control activo: di 'espacio', 'rojo/verde/azul' o 'invertir'.")
+    else:
+        print(voice_listener.error_message)
+        voice_listener = None
+
 loop_start_due_time = None
 loop_playing = False
 camera_horizontal_flip = CAMERA_HORIZONTAL_FLIP_DEFAULT
@@ -672,6 +1090,7 @@ beat_blocks = []
 beat_score = 0
 beat_misses = 0
 beat_last_spawn_time = time.perf_counter()
+camera_read_fail_count = 0
 
 cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
 if FULLSCREEN_PREVIEW:
@@ -679,7 +1098,16 @@ if FULLSCREEN_PREVIEW:
 
 while True:
     ret, frame = cap.read()
-    if not ret: break
+    if not ret:
+        camera_read_fail_count += 1
+        if camera_read_fail_count == 1:
+            print("[Camera] No se pudo leer frame de la camara. Reintentando...")
+        if camera_read_fail_count >= 45:
+            print("[Camera] Lectura fallida continua. Cerrando la app para liberar recursos.")
+            break
+        time.sleep(0.01)
+        continue
+    camera_read_fail_count = 0
 
     now = time.perf_counter()
     dt = float(np.clip(now - last_frame_time, 0.0, 0.10))
@@ -702,6 +1130,49 @@ while True:
         while (now - beat_last_spawn_time) >= BEAT_SPAWN_INTERVAL_S and len(beat_blocks) < BEAT_BLOCK_MAX_ACTIVE:
             beat_blocks.append(create_beat_block())
             beat_last_spawn_time += BEAT_SPAWN_INTERVAL_S
+
+    if voice_listener is not None:
+        if voice_listener.error_message:
+            print(voice_listener.error_message)
+            voice_listener.stop()
+            voice_listener = None
+        else:
+            for voice_command, spoken_text in voice_listener.pop_commands():
+                command_now = time.perf_counter()
+                if (command_now - voice_last_command_time.get(voice_command, 0.0)) < VOICE_COMMAND_COOLDOWN_S:
+                    continue
+                voice_last_command_time[voice_command] = command_now
+
+                if voice_command == "toggle_power":
+                    laser_target_on = not laser_target_on
+                    if laser_target_on:
+                        stop_all_sounds()
+                        loop_playing = False
+                        play_saber_on_sound(saber_on_sound_path)
+                        loop_start_due_time = command_now + max(0.0, loop_start_delay_s)
+                        print(f"[Voice] '{spoken_text}' -> sable ON")
+                    else:
+                        stop_all_sounds()
+                        loop_playing = False
+                        play_saber_off_sound(saber_off_sound_path)
+                        loop_start_due_time = None
+                        print(f"[Voice] '{spoken_text}' -> sable OFF")
+                    last_toggle_time = command_now
+
+                elif voice_command == "toggle_flip":
+                    camera_horizontal_flip = not camera_horizontal_flip
+                    print(
+                        f"[Voice] '{spoken_text}' -> inversion horizontal: "
+                        f"{'ON' if camera_horizontal_flip else 'OFF'}"
+                    )
+                    last_flip_toggle_time = command_now
+
+                elif voice_command.startswith("color_"):
+                    color_key = voice_command[-1]
+                    if color_key in SABER_COLOR_PRESETS:
+                        current_saber_color_key = color_key
+                        color_name = SABER_COLOR_PRESETS[color_key]["name"]
+                        print(f"[Voice] '{spoken_text}' -> color {color_name}")
 
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     corners, ids, _ = detector.detectMarkers(gray)
@@ -1084,6 +1555,14 @@ while True:
     display_frame = fit_frame_to_window(mirrored_frame, window_w, window_h)
     cv2.imshow(WINDOW_NAME, display_frame)
 
+    try:
+        if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
+            print("[App] Ventana cerrada por el usuario.")
+            break
+    except cv2.error:
+        print("[App] Ventana no disponible. Cerrando la app.")
+        break
+
     key = cv2.waitKey(1) & 0xFF
     if key == ord(" "):
         toggle_now = time.perf_counter()
@@ -1097,6 +1576,7 @@ while True:
             else:
                 stop_all_sounds()
                 loop_playing = False
+                play_saber_off_sound(saber_off_sound_path)
                 loop_start_due_time = None
             last_toggle_time = toggle_now
     if key == ord("i"):
@@ -1116,5 +1596,7 @@ while True:
 cap.release()
 if pose_sender is not None:
     pose_sender.close()
+if voice_listener is not None:
+    voice_listener.stop()
 shutdown_audio_backend()
 cv2.destroyAllWindows()
