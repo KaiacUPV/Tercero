@@ -1,3 +1,8 @@
+"""Herramienta de calibracion de camara.
+
+Permite capturar varias imagenes de un patron (chessboard o circulos), calcular
+la matriz de camara/distorsion y probar la proyeccion de un punto virtual.
+"""
 import cv2
 import numpy as np
 import argparse
@@ -7,6 +12,7 @@ import argparse
 # Crear puntos 3D del patrón
 # -----------------------------
 def create_object_points(pattern_size, square_size=1):
+    """Crea coordenadas 3D del patron en el plano Z=0."""
 
     objp = np.zeros((pattern_size[0] * pattern_size[1], 3), np.float32)
     objp[:, :2] = np.mgrid[0:pattern_size[0], 0:pattern_size[1]].T.reshape(-1, 2)
@@ -19,6 +25,7 @@ def create_object_points(pattern_size, square_size=1):
 # Detectar patrón
 # -----------------------------
 def detect_pattern(gray, pattern_size, pattern_type):
+    """Detecta el patron elegido sobre una imagen en escala de grises."""
 
     if pattern_type == "chessboard":
 
@@ -38,6 +45,7 @@ def detect_pattern(gray, pattern_size, pattern_type):
 # Captura de imágenes y calibración
 # -----------------------------
 def calibrate_camera(num_images, pattern_size, pattern_type):
+    """Captura muestras con la webcam y guarda camera_calibration.npz."""
 
     cap = cv2.VideoCapture(0)
 
@@ -85,6 +93,7 @@ def calibrate_camera(num_images, pattern_size, pattern_type):
         key = cv2.waitKey(1)
 
         if key == ord('s') and found:
+            # Solo guardamos frames donde el patron esta detectado correctamente.
 
             objpoints.append(objp)
             imgpoints.append(corners)
@@ -127,6 +136,7 @@ def calibrate_camera(num_images, pattern_size, pattern_type):
 # Proyección de punto virtual
 # -----------------------------
 def project_virtual_point(pattern_size):
+    """Carga la calibracion y proyecta un punto 3D sobre la imagen."""
 
     data = np.load("camera_calibration.npz")
 
@@ -185,6 +195,7 @@ def project_virtual_point(pattern_size):
 # Error de reproyección
 # -----------------------------
 def compute_reprojection_error(objpoints, imgpoints, rvecs, tvecs, mtx, dist):
+    """Calcula el error medio entre puntos detectados y reproyectados."""
 
     total_error = 0
 
@@ -209,6 +220,7 @@ def compute_reprojection_error(objpoints, imgpoints, rvecs, tvecs, mtx, dist):
 # MAIN
 # -----------------------------
 def main():
+    """CLI sencillo para calibrar o probar una calibracion existente."""
 
     parser = argparse.ArgumentParser()
 

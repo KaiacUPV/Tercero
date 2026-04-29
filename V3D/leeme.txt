@@ -1,0 +1,153 @@
+
+
+Este proyecto son dos prototipos en Python:
+
+- Sable en realidad aumentada:
+  Es una demo que usa la cámra de la imagen para ver cómo representa el sable 
+  a partir del cubo ArUco. 
+  - Controles (teclado):
+    - ESC: salir
+    - Espacio: encender/apagar el sable
+    - R/G/B: cambiar color (rojo/verde/azul)
+    - I: invertir preview (espejo visual)
+  - Control por voz (si Vosk esta disponible):
+    - "espacio": encender/apagar
+    - "rojo"/"verde"/"azul": color
+    - "invertir"/"espejo": toggle flip 
+
+
+
+- Juego tipo Beat Saber:
+  Juego 3D que consta del modo de cortar bloques/reflejar disparos y el modo
+  combate que consta en bloquear ataques de un sable enemigo. También ofrece 
+  un modo en realidad virtual para usarlo en unas Gafas VR que usan el movil.
+  - Controles (teclado):
+    - ESC: salir
+    - Espacio: encender/apagar hoja
+    - R/G/B: cambiar color
+    - I: iniciar/reiniciar modo actual
+    - C: cambiar a modo combate
+    - M: espejo X (mirror)
+    - V: activar/desactivar VR (pantalla partida)
+    - Z: recentrar tracking
+  - Control por voz (si Vosk esta disponible):
+    - "sable"/"saber": encender/apagar
+    - "cubos": modo cubos
+    - "combate": modo combate
+    - "reset": recentrar
+    - "rojo"/"verde"/"azul": color
+    - "invertir"/"espejo": mirror X
+    - "realidad virtual": VR on/off
+
+PLATAFORMA (SISTEMA OPERATIVO)
+------------------------------
+
+Estado actual:
+- Está desarrollada en Windows. En Windows funciona bien siempre que tengas:
+  - Drivers OpenGL correctos (GPU / drivers al dia).
+  - Una webcam accesible por OpenCV.
+
+Se puede usar en otros sistemas operativos?
+- Si. El codigo es Python multiplataforma y, en general, puede ejecutarse en:
+  - Linux (Ubuntu/Debian/Fedora, etc.)
+  - macOS (con matices)
+
+Notas importantes por plataforma:
+- Linux:
+  - Suele funcionar bien.
+  - Para voice control (sounddevice) normalmente hay que instalar PortAudio.
+  - En algunas distros, la webcam puede requerir permisos/grupos (video) o cerrar apps que la usan.
+
+- macOS:
+  - Puede funcionar, pero:
+    - Requiere permisos de camara/microfono para la app/terminal.
+    - El soporte de audio (OpenAL / dispositivos) puede variar.
+    - Dependiendo de la version, PyOpenGL + pygame pueden requerir ajustes.
+
+Navegador web:
+- No es una app web. No corre en navegador.
+
+Modo VR:
+Para el modo VR se utiliza Sunshine como servidor en el PC y Moonlight como cliente en Android para el
+streaming de vídeo.Además, la app HyperIMU envía por UDP los datos del sensor rotation_vector, que se 
+usan para controlar la orientación en el entorno virtual. Este sistema funciona en Windows y Linux como 
+host, mientras que en macOS se limita principalmente al uso como cliente.
+
+CARPETAS IMPORTANTES (ASSETS)
+-----------------------------
+
+Este repo asume estas rutas:
+
+- audios/
+  - sable-on.wav
+  - sable-off.wav
+  - loop.wav
+  - disparo.wav
+  - vida.wav
+  - corte.wav
+  - parry.wav
+
+- calibracion/ o calibración/ (segun como la hayas creado)
+  - camera_calibration.npz   (recomendado)
+  - calibracion_camara.npz   (fallback)
+
+- vosk-model-small-es-0.42/
+  - modelo de Vosk (para control por voz)
+
+
+DEPENDENCIAS (PYTHON) Y COMO INSTALARLAS
+----------------------------------------
+
+Requisitos recomendados:
+- Python 3.10+ 
+- pip actualizado
+
+1) Crear un entorno virtual (recomendado)
+   Windows (PowerShell):
+     py -3 -m venv .venv
+     .\\.venv\\Scripts\\Activate.ps1
+
+   Linux/macOS (bash/zsh):
+     python3 -m venv .venv
+     source .venv/bin/activate
+
+2) Instalar dependencias
+   pip install -U pip
+   pip install -r requirements.txt
+
+
+DEPENDENCIAS DEL SISTEMA (SOLO SI USAS VOZ)
+-------------------------------------------
+
+Windows:
+- Normalmente no hace falta nada extra para sounddevice.
+
+Linux (ejemplo Ubuntu/Debian):
+- sudo apt-get update
+- sudo apt-get install -y portaudio19-dev
+
+macOS (Homebrew):
+- brew install portaudio
+
+
+SCRIPTS DE INSTALACION
+----------------------
+
+Windows (PowerShell):
+- Ejecuta: instalar_windows.ps1
+  Esto crea/usa .venv e instala requirements.txt.
+
+
+COMO EJECUTAR
+-------------
+
+- Realidad aumentada:
+  python .\main_realidad_aumentada.py
+-Beat Saber:
+  python .\main_beatsaber.py
+
+
+
+Consejos:
+- Si la camara no abre: cierra otras apps que la esten usando (Teams/Discord/navegador, etc.)
+- Si el micro o Vosk fallan: la app debe seguir funcionando sin voz (degradacion).

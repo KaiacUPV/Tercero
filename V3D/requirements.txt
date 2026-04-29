@@ -1,0 +1,16 @@
+# Core
+numpy
+opencv-contrib-python
+pygame-ce
+
+# OpenGL rendering
+PyOpenGL
+PyOpenGL_accelerate
+
+# Voice control (optional at runtime; installed by default here)
+sounddevice
+vosk
+
+# OpenAL backend (optional; pygame mixer is fallback)
+openal
+
