@@ -1,4 +1,4 @@
-# Auto-extracted from id.py without modifying the original file.
+
 """Suavizado y rotaciones para tracking RA.
 
 OpenCV entrega poses con ruido; este modulo suaviza traslacion/rotacion y crea

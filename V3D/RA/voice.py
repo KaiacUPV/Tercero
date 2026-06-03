@@ -1,4 +1,4 @@
-# Auto-extracted from id.py without modifying the original file.
+
 """Control por voz del prototipo RA.
 
 Ejecuta Vosk en un hilo, parsea frases simples (espacio, colores, invertir) y
